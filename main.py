@@ -1,237 +1,244 @@
+
+
 import streamlit as st
-from langchain_community.vectorstores import Chroma
-from langchain_google_genai import ChatGoogleGenerativeAI, GoogleGenerativeAIEmbeddings
-from langchain.text_splitter import RecursiveCharacterTextSplitter
-from langchain.chains import ConversationalRetrievalChain
-from langchain.memory import ConversationBufferMemory
-from youtube_transcript_api import YouTubeTranscriptApi
 import os
 import re
 from pytube import YouTube
+from youtube_transcript_api import YouTubeTranscriptApi
 
-def extract_video_id(url):
-    """Extract the video ID from various YouTube URL formats."""
+# LangChain + Google Generative AI
+from langchain.text_splitter import RecursiveCharacterTextSplitter
+from langchain.chains import ConversationalRetrievalChain
+from langchain.memory import ConversationBufferMemory
+from langchain.schema import Document
+
+# Community tools
+from langchain_community.vectorstores import Chroma
+from langchain_google_genai import ChatGoogleGenerativeAI, GoogleGenerativeAIEmbeddings
+
+# Ensure we have the Google API key from secrets
+if "GOOGLE_API_KEY" in st.secrets:
+    os.environ["GOOGLE_API_KEY"] = st.secrets["GOOGLE_API_KEY"]
+else:
+    st.error("No Google API key found in Streamlit secrets!")
+    st.stop()
+
+def extract_video_id(url: str):
+    """
+    Extract the video ID from various YouTube URL formats.
+    """
     youtube_regex = (
         r'(https?://)?(www\.)?'
         '(youtube|youtu|youtube-nocookie)\.(com|be)/'
-        '(watch\?v=|embed/|v/|.+\?v=)?([^&=%\?]{11})')
-    
-    youtube_regex_match = re.match(youtube_regex, url)
-    
-    if youtube_regex_match:
-        return youtube_regex_match.group(6)
+        '(watch\?v=|embed/|v/|.+\?v=)?([^&=%\?]{11})'
+    )
+    match = re.match(youtube_regex, url)
+    if match:
+        return match.group(6)
     return None
 
-def get_video_info(url):
-    """Get video title and other info using pytube."""
+def get_video_info(url: str):
+    """
+    Get basic info (title, author, length) from a YouTube video using pytube.
+    """
     try:
         yt = YouTube(url)
         return {
-            'title': yt.title,
-            'author': yt.author,
-            'length': yt.length
+            "title": yt.title,
+            "author": yt.author,
+            "length": yt.length
         }
     except Exception as e:
-        st.error(f"Error getting video info: {str(e)}")
+        st.error(f"Error getting video info: {e}")
         return None
 
-def load_video_transcript(video_url):
-    """Load and return the transcript of a YouTube video."""
+def load_video_transcript(video_url: str):
+    """
+    Load the transcript from a YouTube video, prioritizing English transcripts.
+    Returns a list containing a single LangChain Document with transcript text.
+    """
     try:
-        # First, validate and extract video ID
+        # Validate & extract the ID
         video_id = extract_video_id(video_url)
         if not video_id:
-            st.error("Invalid YouTube URL format")
+            st.error("Invalid YouTube URL format.")
             return None
 
-        # Display video info
-        st.info("Fetching video information...")
-        video_info = get_video_info(video_url)
-        if video_info:
-            st.write(f"📺 Video: {video_info['title']}")
-            st.write(f"👤 Channel: {video_info['author']}")
+        # Get & display some info
+        info = get_video_info(video_url)
+        if info:
+            st.write(f"**Title:** {info['title']}")
+            st.write(f"**Channel:** {info['author']}")
+            st.write(f"**Video Length (s):** {info['length']}")
 
-        # Get available transcripts
-        st.info("Fetching available transcripts...")
+        # Attempt to retrieve available transcripts
+        st.info("Fetching transcripts...")
         transcript_list = YouTubeTranscriptApi.list_transcripts(video_id)
-        
-        # Try to get English transcript first
+
+        # Try to get English transcripts (generated or manual)
+        transcript = None
         try:
             transcript = transcript_list.find_generated_transcript(['en'])
         except:
             try:
                 transcript = transcript_list.find_manually_created_transcript(['en'])
             except:
+                # If none found, try any transcript and translate to English
                 try:
-                    # Get any available transcript and translate to English
-                    transcript = transcript_list.find_generated_transcript()
+                    # This might fail if there's no auto-translation
+                    transcript = transcript_list.find_generated_transcript([])
                     transcript = transcript.translate('en')
                 except Exception as e:
-                    st.error(f"No suitable transcript found: {str(e)}")
+                    st.error(f"No suitable transcript found: {e}")
                     return None
 
-        # Get the actual transcript text
-        transcript_pieces = transcript.fetch()
-        transcript_text = ' '.join([t['text'] for t in transcript_pieces])
-        
-        if not transcript_text.strip():
-            st.error("Transcript is empty")
+        if not transcript:
+            st.error("No transcripts found for this video in English.")
             return None
-            
-        # Create document
-        from langchain.schema.document import Document
-        doc = Document(
-            page_content=transcript_text,
-            metadata={
-                "source": video_id,
-                "title": video_info['title'] if video_info else "Unknown",
-                "author": video_info['author'] if video_info else "Unknown"
-            }
-        )
-        
+
+        # Build the final text
+        raw_transcript = transcript.fetch()
+        transcript_text = ' '.join([chunk['text'] for chunk in raw_transcript])
+
+        if not transcript_text.strip():
+            st.error("Transcript is empty.")
+            return None
+
+        # Construct a Document object for LangChain
+        doc_meta = {
+            "source": video_id,
+            "title": info['title'] if info else "Unknown",
+            "author": info['author'] if info else "Unknown",
+        }
+        langchain_doc = Document(page_content=transcript_text, metadata=doc_meta)
+
         st.success("Transcript loaded successfully!")
-        return [doc]
+        return [langchain_doc]
 
     except Exception as e:
-        st.error(f"Failed to load transcript: {str(e)}")
-        st.info("Please ensure the video has captions enabled and is publicly accessible")
+        st.error(f"Failed to load transcript: {e}")
+        st.info("Ensure the video is public and has English (or auto-generated) captions.")
         return None
 
-def setup_qa_chain(transcript_data):
-    """Set up the question-answering chain with the video transcript."""
+def setup_qa_chain(transcript_docs):
+    """
+    Build a conversational retrieval chain from the provided transcript docs.
+    """
     try:
-        with st.status("Setting up chat system...") as status:
-            status.write("Splitting text into chunks...")
-            text_splitter = RecursiveCharacterTextSplitter(
-                chunk_size=1000,
-                chunk_overlap=200
-            )
-            chunks = text_splitter.split_documents(transcript_data)
-            
-            status.write("Creating embeddings...")
+        with st.spinner("Setting up the chat system..."):
+            st.info("Splitting text into chunks...")
+            splitter = RecursiveCharacterTextSplitter(chunk_size=1000, chunk_overlap=200)
+            chunks = splitter.split_documents(transcript_docs)
+
+            st.info("Creating embeddings...")
             embeddings = GoogleGenerativeAIEmbeddings(model="models/embedding-001")
-            
-            status.write("Building vector database...")
+
+            st.info("Building vector store...")
             vectorstore = Chroma.from_documents(chunks, embeddings)
-            
-            status.write("Initializing AI model...")
+
+            st.info("Initializing LLM...")
             llm = ChatGoogleGenerativeAI(
                 model="gemini-pro",
                 temperature=0.7,
             )
-            
-            status.write("Setting up conversation memory...")
+
+            st.info("Setting up conversation memory...")
             memory = ConversationBufferMemory(
                 memory_key="chat_history",
                 return_messages=True
             )
-            
-            status.write("Finalizing setup...")
+
+            st.info("Finalizing QA chain...")
             qa_chain = ConversationalRetrievalChain.from_llm(
                 llm=llm,
                 retriever=vectorstore.as_retriever(),
                 memory=memory,
                 return_source_documents=False,
             )
-            
-            status.update(label="✅ Chat system ready!", state="complete")
-            return qa_chain
 
+            st.success("✅ Chat system ready!")
+            return qa_chain
     except Exception as e:
-        st.error(f"Error in setup_qa_chain: {str(e)}")
+        st.error(f"Error in setup_qa_chain: {e}")
         return None
 
 def main():
     st.title("💬 YouTube Video Chat Assistant")
-    
-    # Initialize session state
-    if 'chat_history' not in st.session_state:
+
+    # Initialize session states
+    if "chat_history" not in st.session_state:
         st.session_state.chat_history = []
-    if 'video_loaded' not in st.session_state:
+    if "video_loaded" not in st.session_state:
         st.session_state.video_loaded = False
-    if 'qa_chain' not in st.session_state:
+    if "qa_chain" not in st.session_state:
         st.session_state.qa_chain = None
-        
-    # Sidebar
+
+    # Sidebar with instructions
     with st.sidebar:
         st.markdown("""
-        ### How to use:
-        1. Enter a YouTube video URL
-        2. Click 'Load Video' to process the transcript
-        3. Ask questions about the video content
-        
-        ### Note:
-        - Video must have closed captions available
-        - Only processes English transcripts currently
+        ### Instructions
+        1. Enter a public YouTube video URL with English captions.
+        2. Click "**Load Video**" to fetch and process its transcript.
+        3. Ask questions about the video content in the chat box.
+
+        **Note:** 
+        - Only English transcripts are supported currently.
+        - Some private or region-restricted videos may fail to load transcripts.
         """)
-        
-        if 'GOOGLE_API_KEY' in st.secrets:
-            st.success("API Key: Configured ✓")
-        else:
-            st.error("API Key: Missing ✗")
     
-    # Video URL input
+    # Text input for the YouTube URL
     video_url = st.text_input(
         "Enter YouTube Video URL:",
-        help="Paste the full YouTube video URL here"
+        help="Paste a full YouTube link, e.g. https://www.youtube.com/watch?v=..."
     )
-    
-    # Load video button
+
+    # Button to process video
     if video_url:
-        col1, col2 = st.columns([1, 6])
-        with col1:
-            process_video = st.button("Load Video", type="primary")
-        
-        if process_video:
-            with st.spinner("Loading video..."):
-                # Reset states
-                st.session_state.video_loaded = False
-                st.session_state.chat_history = []
-                
-                # Load transcript
-                transcript = load_video_transcript(video_url)
-                if transcript:
-                    qa_chain = setup_qa_chain(transcript)
-                    
-                    if qa_chain:
-                        st.session_state.qa_chain = qa_chain
+        if st.button("Load Video"):
+            st.session_state.video_loaded = False
+            st.session_state.chat_history = []
+
+            with st.spinner("Loading and processing transcript..."):
+                transcript_docs = load_video_transcript(video_url)
+                if transcript_docs:
+                    chain = setup_qa_chain(transcript_docs)
+                    if chain:
+                        st.session_state.qa_chain = chain
                         st.session_state.video_loaded = True
-                        st.success("✅ Video processed successfully!")
-    
+                        st.success("✅ Video processed successfully! Start chatting below.")
+
     # Chat interface
     if st.session_state.video_loaded and st.session_state.qa_chain:
-        st.markdown("### Chat")
+        st.subheader("Chat about the video")
         
-        # Display chat history
-        for message in st.session_state.chat_history:
-            with st.chat_message(message["role"]):
-                st.write(message["content"])
-        
-        # Chat input
-        if prompt := st.chat_input("Ask about the video..."):
-            st.session_state.chat_history.append({"role": "user", "content": prompt})
-            
+        # Display any existing chat messages
+        for msg in st.session_state.chat_history:
+            with st.chat_message(msg["role"]):
+                st.write(msg["content"])
+
+        # User input in the chat
+        user_input = st.chat_input("Ask about the video...")
+        if user_input:
+            # Append user question
+            st.session_state.chat_history.append({"role": "user", "content": user_input})
             with st.chat_message("user"):
-                st.write(prompt)
-            
+                st.write(user_input)
+
+            # Generate response
             with st.chat_message("assistant"):
                 with st.spinner("Thinking..."):
                     try:
-                        response = st.session_state.qa_chain({"question": prompt})
-                        st.write(response['answer'])
+                        response = st.session_state.qa_chain({"question": user_input})
+                        answer = response["answer"]
+                        st.write(answer)
                         st.session_state.chat_history.append(
-                            {"role": "assistant", "content": response['answer']}
+                            {"role": "assistant", "content": answer}
                         )
                     except Exception as e:
-                        st.error(f"Error generating response: {str(e)}")
+                        st.error(f"Error generating response: {e}")
     
     elif not video_url:
-        st.info("👆 Start by entering a YouTube video URL above")
+        st.info("Enter a YouTube link above to get started!")
 
 if __name__ == "__main__":
-    if 'GOOGLE_API_KEY' in st.secrets:
-        os.environ['GOOGLE_API_KEY'] = st.secrets['GOOGLE_API_KEY']
-        main()
-    else:
-        st.error('Please set GOOGLE_API_KEY in your Streamlit secrets.')
-        st.stop()
+    main()
