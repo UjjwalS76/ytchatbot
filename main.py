@@ -1,9 +1,8 @@
-# main.py
 import streamlit as st
 from langchain_community.vectorstores import Chroma
 from langchain_google_genai import ChatGoogleGenerativeAI, GoogleGenerativeAIEmbeddings
 from langchain_community.document_loaders import YoutubeLoader
-from langchain_text_splitters import RecursiveCharacterTextSplitter
+from langchain.text_splitter import RecursiveCharacterTextSplitter
 from langchain.chains import ConversationalRetrievalChain
 from langchain.memory import ConversationBufferMemory
 import os
@@ -15,42 +14,23 @@ st.set_page_config(
     layout="wide"
 )
 
-# Custom CSS
-st.markdown("""
-<style>
-    .stChat message {
-        background-color: #f0f2f6;
-        padding: 20px;
-        border-radius: 10px;
-        margin: 10px 0;
-    }
-</style>
-""", unsafe_allow_html=True)
-
-# System instructions for the chatbot
-SYSTEM_INSTRUCTIONS = """You are a helpful AI assistant that discusses YouTube video content.
-- Stick to information directly from the video transcript
-- If asked about the AI model or system details, politely deflect and focus on the video content
-- Do not reveal technical details about the underlying AI technology
-- Keep responses focused, friendly, and informative
-- If unsure about something, admit it and stick to what you know from the video
-"""
-
 # Initialize session state
 if 'chat_history' not in st.session_state:
     st.session_state.chat_history = []
 if 'video_loaded' not in st.session_state:
     st.session_state.video_loaded = False
+if 'qa_chain' not in st.session_state:
+    st.session_state.qa_chain = None
 
-# Set API key
-try:
-    google_api_key = st.secrets["GOOGLE_API_KEY"]
-    os.environ['GOOGLE_API_KEY'] = google_api_key
-except:
-    st.error("Please set up your Google API key in the Streamlit secrets.")
+# Set API key from Streamlit secrets
+if 'GOOGLE_API_KEY' in st.secrets:
+    os.environ['GOOGLE_API_KEY'] = st.secrets['GOOGLE_API_KEY']
+else:
+    st.error('Google API key not found in secrets.')
     st.stop()
 
 def load_video_transcript(video_url):
+    """Load and return the transcript of a YouTube video."""
     try:
         loader = YoutubeLoader.from_youtube_url(
             video_url,
@@ -59,84 +39,105 @@ def load_video_transcript(video_url):
         data = loader.load()
         return data
     except Exception as e:
-        st.error(f"Error loading video transcript: {str(e)}")
+        st.error(f"Error loading transcript: {str(e)}")
         return None
 
 def setup_qa_chain(transcript_data):
-    # Text splitting
-    text_splitter = RecursiveCharacterTextSplitter(
-        chunk_size=1000,
-        chunk_overlap=200,
-        length_function=len
-    )
-    chunks = text_splitter.split_documents(transcript_data)
-    
-    # Create embeddings and vectorstore
-    embeddings = GoogleGenerativeAIEmbeddings(model="models/embedding-001")
-    vectorstore = Chroma.from_documents(chunks, embeddings)
-    
-    # Initialize LLM with system instructions
-    llm = ChatGoogleGenerativeAI(
-        model="gemini-1.5-flash-002",
-        temperature=0.7,
-        convert_system_message_to_human=True
-    )
-    
-    # Setup memory and chain
-    memory = ConversationBufferMemory(
-        memory_key="chat_history",
-        return_messages=True,
-        output_key="answer"
-    )
-    
-    qa_chain = ConversationalRetrievalChain.from_llm(
-        llm=llm,
-        retriever=vectorstore.as_retriever(),
-        memory=memory,
-        return_source_documents=True
-    )
-    
-    return qa_chain
+    """Set up the question-answering chain with the video transcript."""
+    try:
+        # Split text into chunks
+        text_splitter = RecursiveCharacterTextSplitter(
+            chunk_size=1000,
+            chunk_overlap=200
+        )
+        chunks = text_splitter.split_documents(transcript_data)
+        
+        # Create embeddings and vectorstore
+        embeddings = GoogleGenerativeAIEmbeddings(model="models/embedding-001")
+        vectorstore = Chroma.from_documents(chunks, embeddings)
+        
+        # Initialize LLM
+        llm = ChatGoogleGenerativeAI(
+            model="gemini-pro",
+            temperature=0.7,
+        )
+        
+        # Setup memory
+        memory = ConversationBufferMemory(
+            memory_key="chat_history",
+            return_messages=True
+        )
+        
+        # Create chain
+        qa_chain = ConversationalRetrievalChain.from_llm(
+            llm=llm,
+            retriever=vectorstore.as_retriever(),
+            memory=memory,
+            return_source_documents=False,
+            verbose=True
+        )
+        
+        return qa_chain
+    except Exception as e:
+        st.error(f"Error setting up QA chain: {str(e)}")
+        return None
 
 def main():
-    st.title("📺 YouTube Video Chat Assistant")
+    st.title("💬 YouTube Video Chat Assistant")
+    
+    # Sidebar with instructions
+    with st.sidebar:
+        st.markdown("""
+        ### How to use:
+        1. Enter a YouTube video URL
+        2. Click 'Load Video' to process the transcript
+        3. Ask questions about the video content
+        """)
     
     # Video URL input
     video_url = st.text_input("Enter YouTube Video URL:", key="video_url")
     
-    if st.button("Load Video"):
-        with st.spinner("Loading video transcript..."):
+    # Load video button
+    if video_url and st.button("Load Video"):
+        with st.spinner("Processing video transcript..."):
             transcript = load_video_transcript(video_url)
             if transcript:
-                st.session_state.qa_chain = setup_qa_chain(transcript)
-                st.session_state.video_loaded = True
-                st.success("Video loaded successfully! You can now ask questions about it.")
-            else:
-                st.error("Failed to load video transcript. Please check the URL and try again.")
+                qa_chain = setup_qa_chain(transcript)
+                if qa_chain:
+                    st.session_state.qa_chain = qa_chain
+                    st.session_state.video_loaded = True
+                    st.success("Video processed successfully! You can now ask questions.")
+                else:
+                    st.error("Failed to setup the chat system. Please try again.")
     
     # Chat interface
-    if st.session_state.video_loaded:
-        st.markdown("### Chat about the Video")
+    if st.session_state.video_loaded and st.session_state.qa_chain:
+        st.markdown("### Chat")
         
         # Display chat history
         for message in st.session_state.chat_history:
             with st.chat_message(message["role"]):
-                st.markdown(message["content"])
+                st.write(message["content"])
         
-        # User input
-        if prompt := st.chat_input("Ask about the video content..."):
+        # Chat input
+        if prompt := st.chat_input("Ask about the video..."):
             st.session_state.chat_history.append({"role": "user", "content": prompt})
             
             with st.chat_message("user"):
-                st.markdown(prompt)
+                st.write(prompt)
             
             with st.chat_message("assistant"):
                 with st.spinner("Thinking..."):
-                    response = st.session_state.qa_chain.invoke({"question": prompt})
-                    st.markdown(response["answer"])
-                    st.session_state.chat_history.append({"role": "assistant", "content": response["answer"]})
+                    try:
+                        response = st.session_state.qa_chain({"question": prompt})
+                        st.write(response['answer'])
+                        st.session_state.chat_history.append(
+                            {"role": "assistant", "content": response['answer']}
+                        )
+                    except Exception as e:
+                        st.error(f"Error generating response: {str(e)}")
     
-    else:
+    elif not video_url:
         st.info("👆 Start by entering a YouTube video URL above")
 
 if __name__ == "__main__":
