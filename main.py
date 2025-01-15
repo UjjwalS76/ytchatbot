@@ -4,18 +4,21 @@ import re
 from youtube_transcript_api import YouTubeTranscriptApi
 from typing import Optional, Dict, List
 
-# LangChain + Google Generative AI
+# LangChain 
 from langchain.text_splitter import RecursiveCharacterTextSplitter
 from langchain.chains import ConversationalRetrievalChain
 from langchain.memory import ConversationBufferMemory
 from langchain.schema import Document
-
-# FAISS instead of Chroma for vector store
 from langchain_community.vectorstores import FAISS
-from langchain_google_genai import ChatGoogleGenerativeAI, GoogleGenerativeAIEmbeddings
+from langchain_community.embeddings import HuggingFaceEmbeddings
+from langchain_community.chat_models import ChatPerplexity
 
-# Replace with your API key
-os.environ["GOOGLE_API_KEY"] = "YOUR-API-KEY-HERE"
+# Set API key from Streamlit secrets
+if 'PERPLEXITY_API_KEY' in st.secrets:
+    os.environ['PERPLEXITY_API_KEY'] = st.secrets['PERPLEXITY_API_KEY']
+else:
+    st.error('Please set PERPLEXITY_API_KEY in Streamlit secrets!')
+    st.stop()
 
 def extract_video_id(url: str) -> Optional[str]:
     """Extract YouTube video ID from URL."""
@@ -105,17 +108,19 @@ def setup_qa_chain(transcript_docs):
         )
         chunks = text_splitter.split_documents(transcript_docs)
         
-        # Create embeddings
-        embeddings = GoogleGenerativeAIEmbeddings(model="models/embedding-001")
+        # Create embeddings using HuggingFace
+        embeddings = HuggingFaceEmbeddings(
+            model_name="all-MiniLM-L6-v2",
+            model_kwargs={'device': 'cpu'}
+        )
         
-        # Use FAISS instead of Chroma
+        # Create vector store
         vectorstore = FAISS.from_documents(chunks, embeddings)
         
-        # Setup LLM
-        llm = ChatGoogleGenerativeAI(
-            model="gemini-pro",
-            temperature=0.7,
-            convert_system_message_to_human=True
+        # Setup Perplexity LLM
+        llm = ChatPerplexity(
+            model="llama-3.1-sonar-small-128k-online",
+            temperature=0.7
         )
         
         # Setup memory and chain
@@ -212,4 +217,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-    
