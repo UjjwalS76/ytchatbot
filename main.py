@@ -5,93 +5,74 @@ from langchain_community.document_loaders import YoutubeLoader
 from langchain.text_splitter import RecursiveCharacterTextSplitter
 from langchain.chains import ConversationalRetrievalChain
 from langchain.memory import ConversationBufferMemory
+from youtube_transcript_api import YouTubeTranscriptApi
 import os
-import logging
+import re
 
-# Configure logging
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger(__name__)
+def extract_video_id(youtube_url):
+    """Extract video ID from YouTube URL."""
+    patterns = [
+        r'(?:v=|\/videos\/|embed\/|youtu.be\/|\/v\/|\/e\/|watch\?v=|youtube.com\/watch\?v=)([^#\&\?\n]*)',
+    ]
+    
+    for pattern in patterns:
+        match = re.search(pattern, youtube_url)
+        if match:
+            return match.group(1)
+    return None
 
-# Page config
-st.set_page_config(
-    page_title="YouTube Video Chat Assistant",
-    page_icon="🎥",
-    layout="wide"
-)
-
-# Initialize session state
-if 'chat_history' not in st.session_state:
-    st.session_state.chat_history = []
-if 'video_loaded' not in st.session_state:
-    st.session_state.video_loaded = False
-if 'qa_chain' not in st.session_state:
-    st.session_state.qa_chain = None
-
-# Set API key from Streamlit secrets
-if 'GOOGLE_API_KEY' in st.secrets:
-    os.environ['GOOGLE_API_KEY'] = st.secrets['GOOGLE_API_KEY']
-    logger.info("API key loaded successfully")
-else:
-    st.error('Google API key not found in secrets.')
-    st.stop()
-
-def validate_youtube_url(url):
-    """Validate if the URL is a proper YouTube URL."""
-    if not url:
-        return False
-    if 'youtube.com/watch?v=' not in url and 'youtu.be/' not in url:
-        return False
-    return True
+def get_transcript(video_id):
+    """Get transcript directly using youtube_transcript_api."""
+    try:
+        transcript_list = YouTubeTranscriptApi.get_transcript(video_id)
+        return " ".join([t['text'] for t in transcript_list])
+    except Exception as e:
+        st.error(f"Error getting transcript: {str(e)}")
+        return None
 
 def load_video_transcript(video_url):
     """Load and return the transcript of a YouTube video."""
     try:
-        logger.info(f"Attempting to load transcript for URL: {video_url}")
-        
-        if not validate_youtube_url(video_url):
-            st.error("Please enter a valid YouTube URL")
+        # Extract video ID
+        video_id = extract_video_id(video_url)
+        if not video_id:
+            st.error("Could not extract video ID from URL")
             return None
-            
-        loader = YoutubeLoader.from_youtube_url(
-            video_url,
-            add_video_info=False
+        
+        # Get transcript
+        transcript_text = get_transcript(video_id)
+        if not transcript_text:
+            st.error("Could not get transcript")
+            return None
+        
+        # Create a Document object with the transcript
+        from langchain.schema.document import Document
+        doc = Document(
+            page_content=transcript_text,
+            metadata={"source": video_id}
         )
-        data = loader.load()
         
-        if not data:
-            st.error("No transcript found for this video. Make sure the video has closed captions.")
-            return None
-            
-        logger.info(f"Successfully loaded transcript with {len(data)} segments")
-        return data
+        return [doc]
         
     except Exception as e:
-        logger.error(f"Error loading transcript: {str(e)}")
-        st.error(f"Failed to load video transcript: {str(e)}")
+        st.error(f"Error: {str(e)}")
         return None
 
 def setup_qa_chain(transcript_data):
     """Set up the question-answering chain with the video transcript."""
     try:
-        logger.info("Setting up QA chain...")
-        
         # Split text into chunks
         text_splitter = RecursiveCharacterTextSplitter(
             chunk_size=1000,
             chunk_overlap=200
         )
         chunks = text_splitter.split_documents(transcript_data)
-        logger.info(f"Split transcript into {len(chunks)} chunks")
         
         # Create embeddings and vectorstore
-        logger.info("Creating embeddings...")
         embeddings = GoogleGenerativeAIEmbeddings(model="models/embedding-001")
-        
-        logger.info("Creating vector store...")
         vectorstore = Chroma.from_documents(chunks, embeddings)
         
         # Initialize LLM
-        logger.info("Initializing LLM...")
         llm = ChatGoogleGenerativeAI(
             model="gemini-pro",
             temperature=0.7,
@@ -104,74 +85,69 @@ def setup_qa_chain(transcript_data):
         )
         
         # Create chain
-        logger.info("Creating conversation chain...")
         qa_chain = ConversationalRetrievalChain.from_llm(
             llm=llm,
             retriever=vectorstore.as_retriever(),
             memory=memory,
             return_source_documents=False,
-            verbose=True
         )
         
-        logger.info("QA chain setup complete")
         return qa_chain
         
     except Exception as e:
-        logger.error(f"Error in setup_qa_chain: {str(e)}")
-        st.error(f"Error setting up the chat system: {str(e)}")
+        st.error(f"Error in setup_qa_chain: {str(e)}")
         return None
 
 def main():
     st.title("💬 YouTube Video Chat Assistant")
     
-    # Display current status
-    if st.session_state.video_loaded:
-        st.sidebar.success("Video loaded and ready for chat")
-    else:
-        st.sidebar.info("No video loaded")
-    
-    # Sidebar with instructions
+    # Initialize session state
+    if 'chat_history' not in st.session_state:
+        st.session_state.chat_history = []
+    if 'video_loaded' not in st.session_state:
+        st.session_state.video_loaded = False
+    if 'qa_chain' not in st.session_state:
+        st.session_state.qa_chain = None
+
+    # Sidebar
     with st.sidebar:
         st.markdown("""
         ### How to use:
         1. Enter a YouTube video URL
         2. Click 'Load Video' to process the transcript
         3. Ask questions about the video content
-        
-        ### Note:
-        - Video must have closed captions available
-        - Only processes English transcripts currently
         """)
-    
+        
+        # Show API key status
+        if 'GOOGLE_API_KEY' in st.secrets:
+            st.success("API Key: Configured ✓")
+        else:
+            st.error("API Key: Missing ✗")
+            
     # Video URL input
-    video_url = st.text_input(
-        "Enter YouTube Video URL:",
-        key="video_url",
-        help="Paste the full YouTube video URL here"
-    )
+    video_url = st.text_input("Enter YouTube Video URL:", key="video_url")
     
     # Load video button
     if video_url:
-        if st.button("Load Video", key="load_btn"):
-            st.session_state.video_loaded = False  # Reset state
-            st.session_state.chat_history = []     # Clear chat history
-            
+        col1, col2 = st.columns([1, 6])
+        with col1:
+            process_video = st.button("Load Video", type="primary")
+        
+        if process_video:
             with st.spinner("Processing video transcript..."):
-                logger.info("Starting video processing...")
+                # Reset states
+                st.session_state.video_loaded = False
+                st.session_state.chat_history = []
                 
+                # Load transcript
                 transcript = load_video_transcript(video_url)
                 if transcript:
-                    logger.info("Transcript loaded, setting up QA chain...")
                     qa_chain = setup_qa_chain(transcript)
                     
                     if qa_chain:
                         st.session_state.qa_chain = qa_chain
                         st.session_state.video_loaded = True
-                        st.success("✅ Video processed successfully! You can now ask questions.")
-                        logger.info("Video processing complete")
-                    else:
-                        st.error("❌ Failed to setup the chat system. Please try again.")
-                        logger.error("Failed to create QA chain")
+                        st.success("✅ Video processed successfully!")
     
     # Chat interface
     if st.session_state.video_loaded and st.session_state.qa_chain:
@@ -198,11 +174,15 @@ def main():
                             {"role": "assistant", "content": response['answer']}
                         )
                     except Exception as e:
-                        logger.error(f"Error generating response: {str(e)}")
-                        st.error(f"Failed to generate response: {str(e)}")
+                        st.error(f"Error generating response: {str(e)}")
     
     elif not video_url:
         st.info("👆 Start by entering a YouTube video URL above")
 
 if __name__ == "__main__":
-    main()
+    if 'GOOGLE_API_KEY' in st.secrets:
+        os.environ['GOOGLE_API_KEY'] = st.secrets['GOOGLE_API_KEY']
+        main()
+    else:
+        st.error('Please set GOOGLE_API_KEY in your Streamlit secrets.')
+        st.stop()
